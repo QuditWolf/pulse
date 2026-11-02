@@ -35,23 +35,31 @@ Page: `https://quditwolf.qutrit.org/pulse/` (browser asks for the password; any 
 
 ## 3. Monitored server (cron, no install)
 
-Needs `bash`, `curl`, and optionally `nvidia-smi`.
+Reads the BMC `System Temp` sensor via `ipmitool` and pushes it as `system`.
+Needs `bash`, `curl`, `ipmitool`, and one narrow sudo rule (cron cannot type a password):
 
 ```bash
-mkdir -p ~/pulse && cp agent/pulse-agent.sh ~/pulse/
-cp agent/pulse-agent.env.example ~/pulse/pulse-agent.env
-chmod 600 ~/pulse/pulse-agent.env && $EDITOR ~/pulse/pulse-agent.env
-~/pulse/pulse-agent.sh && echo ok    # first push, should appear on the page
-( crontab -l 2>/dev/null; echo '* * * * * $HOME/pulse/pulse-agent.sh >/dev/null 2>>$HOME/pulse/agent.err' ) | crontab -
+echo "$USER ALL=(root) NOPASSWD: /usr/bin/ipmitool sdr type temperature" | sudo tee /etc/sudoers.d/pulse >/dev/null
+sudo chmod 440 /etc/sudoers.d/pulse && sudo visudo -cf /etc/sudoers.d/pulse
 ```
 
-Metrics sent: `cpu` (hottest k10temp/zenpower/coretemp sensor) and `gpu0..N` (nvidia-smi).
+Install (ENGG uses `~/scripts/pulse`):
+
+```bash
+mkdir -p ~/scripts/pulse && cp agent/pulse-agent.sh ~/scripts/pulse/
+cp agent/pulse-agent.env.example ~/scripts/pulse/pulse-agent.env
+chmod 600 ~/scripts/pulse/pulse-agent.env && $EDITOR ~/scripts/pulse/pulse-agent.env
+~/scripts/pulse/pulse-agent.sh && echo ok    # first push, should appear on the page
+( crontab -l 2>/dev/null; echo '* * * * * $HOME/scripts/pulse/pulse-agent.sh >/dev/null 2>>$HOME/scripts/pulse/agent.err' ) | crontab -
+```
+
+Different sensor name: set `PULSE_SENSOR="<name as in ipmitool>"` in the env file.
 
 ## API
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/ingest` | `Authorization: Bearer <token>`, body `{"metrics":{"cpu":55.1,"gpu0":41}}`, names `[a-z0-9_-]`, values -100..250, max 32 metrics |
+| POST | `/ingest` | `Authorization: Bearer <token>`, body `{"metrics":{"system":37}}`, names `[a-z0-9_-]`, values -100..250, max 32 metrics |
 | GET | `/api/status` | all hosts, online flag, latest values |
 | GET | `/api/history?host=engg-ai-server&hours=24` | `hours` 1..168 |
 | GET | `/healthz` | container healthcheck |
