@@ -9,6 +9,7 @@ Stdlib only. Config via environment:
   PULSE_RETENTION_DAYS  days of history to keep (default 30)
   PULSE_PASSWORD        if set, the API needs a login (in-page form) with this password
 """
+import hashlib
 import hmac
 import json
 import math
@@ -65,6 +66,8 @@ MAX_METRICS = 64
 MAX_HOURS = 24 * 7
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 INDEX_HTML = (Path(__file__).parent / "index.html").read_bytes()
+# Open pages compare this and reload themselves after a deploy.
+UI_VERSION = hashlib.sha256(INDEX_HTML).hexdigest()[:12]
 
 
 def load_tokens():
@@ -98,6 +101,8 @@ class Store:
             cols = {r[1] for r in self.db.execute("PRAGMA table_info(hosts)")}
             if "limits" not in cols:
                 self.db.execute("ALTER TABLE hosts ADD COLUMN limits TEXT")
+            if "metric_order" not in cols:
+                self.db.execute("ALTER TABLE hosts ADD COLUMN metric_order TEXT")
 
     def insert(self, host, ts, metrics, limits):
         with self.lock:
@@ -106,17 +111,18 @@ class Store:
                 "INSERT INTO samples VALUES (?, ?, ?, ?)", [(host, ts, k, v) for k, v in metrics.items()]
             )
             self.db.execute(
-                "INSERT INTO hosts (host, last_seen, limits) VALUES (?, ?, ?) "
-                "ON CONFLICT(host) DO UPDATE SET last_seen = excluded.last_seen, limits = excluded.limits",
-                (host, ts, json.dumps(limits)),
+                "INSERT INTO hosts (host, last_seen, limits, metric_order) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(host) DO UPDATE SET last_seen = excluded.last_seen, limits = excluded.limits, "
+                "metric_order = excluded.metric_order",
+                (host, ts, json.dumps(limits), json.dumps(list(metrics))),
             )
             self.db.execute("COMMIT")
 
     def status(self, now):
         with self.lock:
-            hosts = self.db.execute("SELECT host, last_seen, limits FROM hosts ORDER BY host").fetchall()
+            hosts = self.db.execute("SELECT host, last_seen, limits, metric_order FROM hosts ORDER BY host").fetchall()
             out = []
-            for host, last_seen, limits in hosts:
+            for host, last_seen, limits, order in hosts:
                 rows = self.db.execute(
                     "SELECT metric, value FROM samples WHERE host = ? AND ts = ?", (host, last_seen)
                 ).fetchall()
@@ -126,10 +132,12 @@ class Store:
                     "online": now - last_seen <= OFFLINE_AFTER,
                     "latest": dict(rows),
                     "limits": json.loads(limits or "{}"),
+                    # Order the agent sent them in; the first one is the page's default.
+                    "order": [m for m in json.loads(order or "[]") if m in dict(rows)] or sorted(dict(rows)),
                 })
         # Hosts configured but never seen still show up, as offline.
         seen = {h["host"] for h in out}
-        out += [{"host": h, "last_seen": None, "online": False, "latest": {}, "limits": {}} for h in sorted(TOKENS) if h not in seen]
+        out += [{"host": h, "last_seen": None, "online": False, "latest": {}, "limits": {}, "order": []} for h in sorted(TOKENS) if h not in seen]
         return out
 
     def history(self, host, since, only=None):
@@ -262,7 +270,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return self._send(401, {"error": "login required"})
         if url.path == "/api/status":
-            return self._send(200, {"now": int(time.time()), "offline_after": OFFLINE_AFTER,
+            return self._send(200, {"now": int(time.time()), "offline_after": OFFLINE_AFTER, "ui": UI_VERSION,
                                     "hosts": STORE.status(int(time.time()))})
         if url.path == "/api/history":
             q = parse_qs(url.query)

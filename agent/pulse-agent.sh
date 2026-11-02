@@ -5,12 +5,16 @@
 # Sources and metric names:
 #   ipmitool sensor (BMC)   -> "system", "cpu", "gpu3", "dimma_f", ...   limits: LCR..UCR (fallback LNR..UNR)
 #   /sys/class/hwmon        -> "<driver>_<label>", e.g. "k10temp_tctl", "nvme_composite"   limits: min/lcrit..crit/max
+#                              drivers with several instances get a number: "coretemp_0_core_0", "coretemp_1_core_0"
 #   nvidia-smi              -> "nvidia_gpu<N>"   limit: current + tlimit headroom (max operating temp)
 # (lm-sensors' `sensors` reads the same /sys/class/hwmon data, so it is not needed.)
 #
 # ipmitool needs root; allow exactly this read-only command in sudoers:
 #   <user> ALL=(root) NOPASSWD: /usr/bin/ipmitool sensor
 # Config: pulse-agent.env next to this script.
+#   PULSE_URL, PULSE_TOKEN   required
+#   PULSE_FIRST              optional metric name to send first. The first metric sent is what the page
+#                            shows by default; without it the order is ipmitool, hwmon, nvidia-smi.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,8 +42,16 @@ collect_ipmi() {
 
 collect_hwmon() {
   local h drv f base label n v lo hi t x
+  local -A count=() seen=()
   for h in /sys/class/hwmon/hwmon*; do
     drv=$(cat "$h/name" 2>/dev/null) || continue
+    count[$drv]=$(( ${count[$drv]:-0} + 1 ))
+  done
+  for h in /sys/class/hwmon/hwmon*; do
+    drv=$(cat "$h/name" 2>/dev/null) || continue
+    if (( count[$drv] > 1 )); then
+      x=${seen[$drv]:-0}; seen[$drv]=$((x + 1)); drv="${drv}_$x"
+    fi
     for f in "$h"/temp*_input; do
       [[ -r $f ]] || continue
       base=${f%_input}
@@ -74,17 +86,25 @@ collect_nvidia() {
     done || true
 }
 
-# Merge, keep the first occurrence of a name, build JSON.
-payload=$({ collect_ipmi; collect_hwmon; collect_nvidia; } | awk '
+# Merge, keep the first occurrence of a name, put PULSE_FIRST first, build JSON (key order is kept).
+payload=$({ collect_ipmi; collect_hwmon; collect_nvidia; } | awk -v first="${PULSE_FIRST:-}" '
   function num(x) { return x ~ /^-?[0-9]+(\.[0-9]+)?$/ }
+  function add(i) {
+    m = m (m ? "," : "") "\"" name[i] "\":" val[i]
+    if (lo[i] != "null" || hi[i] != "null")
+      l = l (l ? "," : "") "\"" name[i] "\":[" lo[i] "," hi[i] "]"
+  }
   # No {m,n} regex intervals: mawk (Debian/Ubuntu default awk) does not support them.
   $1 ~ /^[a-z0-9][a-z0-9_-]*$/ && length($1) <= 32 && num($2) && !seen[$1]++ {
-    m = m (m ? "," : "") "\"" $1 "\":" $2
-    if ($3 != "null" || $4 != "null")
-      l = l (l ? "," : "") "\"" $1 "\":[" $3 "," $4 "]"
-    n++
+    n++; name[n] = $1; val[n] = $2; lo[n] = $3; hi[n] = $4
+    if ($1 == first) fi = n
   }
-  END { if (n) printf "{\"metrics\":{%s},\"limits\":{%s}}", m, l }')
+  END {
+    if (!n) exit
+    if (fi) add(fi)
+    for (i = 1; i <= n; i++) if (i != fi) add(i)
+    printf "{\"metrics\":{%s},\"limits\":{%s}}", m, l
+  }')
 
 if [[ -z $payload ]]; then
   echo "pulse-agent: no temperature sensors found" >&2
