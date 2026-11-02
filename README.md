@@ -53,6 +53,9 @@ chmod 600 ~/scripts/pulse/pulse-agent.env && $EDITOR ~/scripts/pulse/pulse-agent
 ( crontab -l 2>/dev/null; echo '* * * * * $HOME/scripts/pulse/pulse-agent.sh >/dev/null 2>>$HOME/scripts/pulse/agent.err' ) | crontab -
 ```
 
+ENGG `System Temp` thresholds per ipmitool: **5–85 °C**. Set on the server as `PULSE_LIMITS=system=5:85`;
+the page shows the range and turns the reading red outside it.
+
 Different sensor name: set `PULSE_SENSOR="<name as in ipmitool>"` in the env file.
 
 ## API

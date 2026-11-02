@@ -33,6 +33,7 @@
   .temps { margin-left: auto; display: flex; gap: 14px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
   .temps span b { font-size: 17px; }
   .temps span small { color: var(--muted); margin-right: 4px; }
+  .temps span small.lim { margin: 0 0 0 6px; font-size: 12px; }
   .chart { margin-top: 12px; width: 100%; overflow: hidden; }
   .uplot { font-family: inherit; }
   .u-legend { color: var(--fg); font-size: 12px; }
@@ -109,7 +110,13 @@ async function refresh() {
         (h.last_seen ? " · " + ago(st.now - h.last_seen) : " · never seen");
       const temps = c.querySelector(".temps"); temps.textContent = "";
       for (const [m, v] of Object.entries(h.latest).sort()) {
-        const s = el("span"); s.append(el("small", null, label(m)), el("b", null, v.toFixed(0) + "°C"));
+        const s = el("span"), lim = (st.limits || {})[m];
+        const b = el("b", null, v.toFixed(0) + "°C");
+        s.append(el("small", null, label(m)), b);
+        if (lim) {
+          if (v < lim[0] || v > lim[1]) b.style.color = css("--bad");
+          s.append(el("small", "lim", ` limit ${lim[0]}–${lim[1]}°C`));
+        }
         if (!h.online) s.style.opacity = 0.5;
         temps.append(s);
       }

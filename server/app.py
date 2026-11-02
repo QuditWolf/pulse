@@ -7,6 +7,7 @@ Stdlib only. Config via environment:
   PULSE_PORT            listen port (default 8080)
   PULSE_OFFLINE_AFTER   seconds without a push before a host counts as offline (default 180)
   PULSE_RETENTION_DAYS  days of history to keep (default 30)
+  PULSE_LIMITS          per-metric safe range shown on the page, "system=5:85,cpu=0:95"
   PULSE_PASSWORD        if set, page + API need HTTP Basic auth with this password (any username)
 """
 import base64
@@ -28,6 +29,21 @@ PORT = int(os.environ.get("PULSE_PORT", "8080"))
 OFFLINE_AFTER = int(os.environ.get("PULSE_OFFLINE_AFTER", "180"))
 RETENTION_DAYS = int(os.environ.get("PULSE_RETENTION_DAYS", "30"))
 PASSWORD = os.environ.get("PULSE_PASSWORD", "")
+
+
+def load_limits():
+    limits = {}
+    for pair in filter(None, (p.strip() for p in os.environ.get("PULSE_LIMITS", "").split(","))):
+        name, _, rng = pair.partition("=")
+        lo, _, hi = rng.partition(":")
+        try:
+            limits[name.strip()] = [float(lo), float(hi)]
+        except ValueError:
+            sys.exit(f"bad PULSE_LIMITS entry {pair!r}: need name=low:high")
+    return limits
+
+
+LIMITS = load_limits()
 MAX_BODY = 4096
 MAX_METRICS = 32
 MAX_HOURS = 24 * 7
@@ -184,7 +200,7 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/":
             return self._send(200, INDEX_HTML, "text/html; charset=utf-8", "max-age=60")
         if url.path == "/api/status":
-            return self._send(200, {"now": int(time.time()), "offline_after": OFFLINE_AFTER,
+            return self._send(200, {"now": int(time.time()), "offline_after": OFFLINE_AFTER, "limits": LIMITS,
                                     "hosts": STORE.status(int(time.time()))})
         if url.path == "/api/history":
             q = parse_qs(url.query)
