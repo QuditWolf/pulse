@@ -30,7 +30,7 @@ Update: `git pull && docker compose up -d --build` (data lives in the `pulse-dat
 
 Paste `vps/nginx.conf` (one `location /pulse/` block) into the existing `server {}` for
 `quditwolf.qutrit.org`, set the homeserver VPN IP, then `nginx -t && systemctl reload nginx`.
-Page: `https://quditwolf.qutrit.org/pulse/` (browser asks for the password; any username).
+Page: `https://quditwolf.qutrit.org/pulse/` (in-page login form; session cookie lasts 30 days).
 `/pulse/ingest` uses the agent token instead, and `/pulse/healthz` is open.
 
 ## 3. Monitored server (cron, no install)

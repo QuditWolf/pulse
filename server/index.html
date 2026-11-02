@@ -39,14 +39,34 @@
   .u-legend { color: var(--fg); font-size: 12px; }
   footer { color: var(--muted); font-size: 12px; margin-top: 20px; text-align: center; }
   .err { color: var(--bad); }
+  .hidden { display: none !important; }
+  #login { max-width: 320px; margin: 15vh auto 0; background: var(--card); border: 1px solid var(--border);
+           border-radius: 10px; padding: 24px; display: flex; flex-direction: column; gap: 12px; }
+  #login h1 { margin-bottom: 4px; }
+  #login input, #login button { font: inherit; padding: 8px 10px; border-radius: 6px;
+           border: 1px solid var(--border); background: var(--bg); color: var(--fg); }
+  #login button { background: var(--fg); color: var(--bg); border-color: var(--fg); cursor: pointer; font-weight: 600; }
+  #login .err { font-size: 13px; min-height: 1em; margin: 0; }
+  .tools { display: flex; gap: 8px; align-items: center; }
+  #logout { background: none; border: 0; color: var(--muted); cursor: pointer; font: inherit; font-size: 13px; }
 </style>
 </head>
 <body>
-<main>
+<form id="login" class="hidden" autocomplete="on">
+  <h1>Pulse</h1>
+  <input type="text" name="username" value="pulse" autocomplete="username" hidden>
+  <input id="pw" type="password" name="password" placeholder="Password" autocomplete="current-password" required autofocus>
+  <button type="submit">Log in</button>
+  <p class="err" id="loginErr"></p>
+</form>
+<main id="app" class="hidden">
   <header>
     <h1>Pulse</h1>
-    <div class="ranges" id="ranges">
-      <button data-h="6">6h</button><button data-h="24" class="on">24h</button><button data-h="168">7d</button>
+    <div class="tools">
+      <div class="ranges" id="ranges">
+        <button data-h="6">6h</button><button data-h="24" class="on">24h</button><button data-h="168">7d</button>
+      </div>
+      <button id="logout" type="button">log out</button>
     </div>
   </header>
   <div id="hosts"></div>
@@ -100,9 +120,26 @@ function renderChart(c, host, data) {
   charts[host] = { u, key };
 }
 
+class AuthError extends Error {}
+async function api(path) {
+  const r = await fetch(path, { credentials: "same-origin" });
+  if (r.status === 401) throw new AuthError();
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+function showLogin(msg) {
+  document.getElementById("app").classList.add("hidden");
+  document.getElementById("login").classList.remove("hidden");
+  document.getElementById("loginErr").textContent = msg || "";
+  document.getElementById("pw").focus();
+}
+
 async function refresh() {
   try {
-    const st = await (await fetch("api/status")).json();
+    const st = await api("api/status");
+    document.getElementById("login").classList.add("hidden");
+    document.getElementById("app").classList.remove("hidden");
     for (const h of st.hosts) {
       const c = card(h);
       c.querySelector(".dot").style.background = h.online ? css("--ok") : css("--bad");
@@ -120,11 +157,13 @@ async function refresh() {
         if (!h.online) s.style.opacity = 0.5;
         temps.append(s);
       }
-      const hist = await (await fetch(`api/history?host=${encodeURIComponent(h.host)}&hours=${hours}`)).json();
+      const hist = await api(`api/history?host=${encodeURIComponent(h.host)}&hours=${hours}`);
       renderChart(c, h.host, hist);
     }
-    document.getElementById("foot").textContent = "updated " + new Date().toLocaleTimeString() + " · refreshes every 60s";
+    const f = document.getElementById("foot");
+    f.textContent = "updated " + new Date().toLocaleTimeString() + " · refreshes every 60s"; f.className = "";
   } catch (e) {
+    if (e instanceof AuthError) return showLogin();
     const f = document.getElementById("foot"); f.textContent = "update failed: " + e.message; f.className = "err";
   }
 }
@@ -141,8 +180,21 @@ window.addEventListener("resize", () => {
     if (box) u.setSize({ width: box.clientWidth, height: 220 });
   }
 });
+document.getElementById("login").addEventListener("submit", async e => {
+  e.preventDefault();
+  const pw = document.getElementById("pw");
+  const r = await fetch("login", { method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: pw.value }) });
+  if (r.ok) { pw.value = ""; return refresh(); }
+  const j = await r.json().catch(() => ({}));
+  showLogin(j.error || "login failed");
+});
+document.getElementById("logout").addEventListener("click", async () => {
+  await fetch("logout", { method: "POST", credentials: "same-origin" });
+  showLogin();
+});
 refresh();
-setInterval(refresh, 60000);
+setInterval(() => { if (document.getElementById("login").classList.contains("hidden")) refresh(); }, 60000);
 </script>
 </body>
 </html>

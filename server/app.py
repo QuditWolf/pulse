@@ -7,9 +7,8 @@ Stdlib only. Config via environment:
   PULSE_PORT            listen port (default 8080)
   PULSE_OFFLINE_AFTER   seconds without a push before a host counts as offline (default 180)
   PULSE_RETENTION_DAYS  days of history to keep (default 30)
-  PULSE_PASSWORD        if set, page + API need HTTP Basic auth with this password (any username)
+  PULSE_PASSWORD        if set, the API needs a login (in-page form) with this password
 """
-import base64
 import hmac
 import json
 import math
@@ -28,6 +27,38 @@ PORT = int(os.environ.get("PULSE_PORT", "8080"))
 OFFLINE_AFTER = int(os.environ.get("PULSE_OFFLINE_AFTER", "180"))
 RETENTION_DAYS = int(os.environ.get("PULSE_RETENTION_DAYS", "30"))
 PASSWORD = os.environ.get("PULSE_PASSWORD", "")
+SESSION_DAYS = 30
+COOKIE = "pulse_session"
+# Crude brute-force brake: at most this many failed logins per minute, across all clients.
+MAX_FAILS_PER_MIN = 10
+_fails = []
+_fails_lock = threading.Lock()
+
+
+def _sign(exp):
+    return hmac.new(PASSWORD.encode(), f"pulse-session:{exp}".encode(), "sha256").hexdigest()
+
+
+def make_session():
+    exp = int(time.time()) + SESSION_DAYS * 86400
+    return f"{exp}.{_sign(exp)}"
+
+
+def valid_session(value):
+    exp, _, sig = value.partition(".")
+    return exp.isdigit() and int(exp) > time.time() and hmac.compare_digest(sig, _sign(int(exp)))
+
+
+def login_allowed():
+    now = time.time()
+    with _fails_lock:
+        _fails[:] = [t for t in _fails if now - t < 60]
+        return len(_fails) < MAX_FAILS_PER_MIN
+
+
+def record_fail():
+    with _fails_lock:
+        _fails.append(time.time())
 
 MAX_BODY = 4096
 MAX_METRICS = 32
@@ -180,27 +211,53 @@ class Handler(BaseHTTPRequestHandler):
     def _authorized(self):
         if not PASSWORD:
             return True
-        auth = self.headers.get("Authorization", "")
-        if not auth.startswith("Basic "):
-            return False
+        for part in self.headers.get("Cookie", "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == COOKIE and valid_session(value):
+                return True
+        return False
+
+    def _cookie(self, value, max_age):
+        return f"{COOKIE}={value}; Max-Age={max_age}; HttpOnly; Secure; SameSite=Strict"
+
+    def _read_body(self):
         try:
-            _, _, pw = base64.b64decode(auth[6:]).decode().partition(":")
+            length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            return False
-        return hmac.compare_digest(pw.encode(), PASSWORD.encode())
+            return None
+        return self.rfile.read(length) if 0 < length <= MAX_BODY else None
+
+    def _login(self):
+        if not PASSWORD:
+            return self._send(200, {"ok": True})
+        if not login_allowed():
+            return self._send(429, {"error": "too many attempts, wait a minute"})
+        body = self._read_body()
+        try:
+            pw = json.loads(body).get("password", "") if body else ""
+        except (ValueError, AttributeError):
+            pw = ""
+        if not isinstance(pw, str) or not hmac.compare_digest(pw.encode(), PASSWORD.encode()):
+            record_fail()
+            return self._send(401, {"error": "wrong password"})
+        body = b'{"ok":true}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Set-Cookie", self._cookie(make_session(), SESSION_DAYS * 86400))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self):
         url = urlparse(self.path)
         if url.path == "/healthz":
             return self._send(200, {"ok": True})
-        if not self._authorized():
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="pulse"')
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
         if url.path == "/":
-            return self._send(200, INDEX_HTML, "text/html; charset=utf-8", "max-age=60")
+            # The page itself holds no data; it shows a login form until the API accepts it.
+            return self._send(200, INDEX_HTML, "text/html; charset=utf-8", "no-cache")
+        if not self._authorized():
+            return self._send(401, {"error": "login required"})
         if url.path == "/api/status":
             return self._send(200, {"now": int(time.time()), "offline_after": OFFLINE_AFTER,
                                     "hosts": STORE.status(int(time.time()))})
@@ -217,7 +274,15 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if urlparse(self.path).path != "/ingest":
+        path = urlparse(self.path).path
+        if path == "/login":
+            return self._login()
+        if path == "/logout":
+            self.send_response(204)
+            self.send_header("Set-Cookie", self._cookie("", 0))
+            self.end_headers()
+            return
+        if path != "/ingest":
             return self._send(404, {"error": "not found"})
         auth = self.headers.get("Authorization", "")
         token = auth[7:] if auth.startswith("Bearer ") else ""
