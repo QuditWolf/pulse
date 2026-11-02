@@ -4,3 +4,4 @@
 agent/pulse-agent.env
 kelper_pulse-probe.txt
 *-probe.txt
+.pulse-state*

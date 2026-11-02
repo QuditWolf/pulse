@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pulse agent: collect every temperature the host exposes and push it to the pulse server.
+# pulse agent: collect every temperature the host exposes, plus CPU/RAM/GPU/disk usage, and push it.
 # Run from cron every minute. Needs bash, curl, awk; optional sources are skipped if missing.
 #
 # Sources and metric names:
@@ -9,6 +9,10 @@
 #   nvidia-smi              -> "nvidia_gpu<N>"   limit: current + tlimit headroom (max operating temp)
 #                              plus "nvidia_gpu_max" (hottest GPU) when there is more than one GPU
 # (lm-sensors' `sensors` reads the same /sys/class/hwmon data, so it is not needed.)
+#   usage (/proc, nvidia-smi) -> "cpu_pct", "mem_pct", "load_pct" (1-min load / cores), "gpu_pct", "vram_pct",
+#                              "gpu<N>_pct", "gpu<N>_vram_pct" (multi-GPU), "disk_busy_pct", "disk_read_mbs",
+#                              "disk_write_mbs". Names ending _pct are percent, _mbs MB/s, everything else °C.
+#   info                    -> uptime, ncpu, mem_gb, load1/5/15 (shown as text, not graphed)
 #
 # ipmitool needs root; allow exactly this read-only command in sudoers:
 #   <user> ALL=(root) NOPASSWD: /usr/bin/ipmitool sensor
@@ -18,12 +22,15 @@
 #                            "system,cpu,nvidia_gpu0". They are sent first, in this order. Without it the
 #                            page shows only the first metric sent (order: ipmitool, hwmon, nvidia-smi).
 #   PULSE_FIRST              older single-metric form of PULSE_DEFAULTS.
+#   PULSE_STATE              state file for CPU/disk deltas (default .pulse-state next to this script).
+# The usage aggregates (cpu_pct, mem_pct, ...) are always appended to the defaults.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${PULSE_ENV:-$DIR/pulse-agent.env}"
 : "${PULSE_URL:?set PULSE_URL}" "${PULSE_TOKEN:?set PULSE_TOKEN}"
+STATE=${PULSE_STATE:-$DIR/.pulse-state}
 
 # Each collector prints lines: "<name> <value> <low|null> <high|null>"
 slug() { tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/_/g; s/^_+|_+$//g; s/_temp$//; s/^temp_//'; }
@@ -83,19 +90,91 @@ collect_hwmon() {
 
 collect_nvidia() {
   command -v nvidia-smi >/dev/null 2>&1 || return 0
-  timeout 15 nvidia-smi --query-gpu=index,temperature.gpu,temperature.gpu.tlimit \
+  timeout 15 nvidia-smi --query-gpu=index,temperature.gpu,temperature.gpu.tlimit,utilization.gpu,memory.used,memory.total \
     --format=csv,noheader,nounits 2>/dev/null | awk -F', *' '
-    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+    function int_(x) { return x ~ /^[0-9]+$/ }
+    int_($1) && int_($2) {
       hi = ($3 ~ /^-?[0-9]+$/) ? $2 + $3 : "null"
       print "nvidia_gpu" $1, $2, "null", hi
       if (!n++ || $2 + 0 > mx) mx = $2 + 0
       if (hi != "null" && (mh == "" || hi < mh)) mh = hi
     }
-    END { if (n > 1) print "nvidia_gpu_max", mx, "null", (mh == "" ? "null" : mh) }' || true
+    int_($1) { ng++; g[ng] = $1; u[ng] = $4; mu[ng] = $5; mt[ng] = $6 }
+    END {
+      if (n > 1) print "nvidia_gpu_max", mx, "null", (mh == "" ? "null" : mh)
+      # Usage: per GPU only on multi-GPU hosts; gpu_pct / vram_pct are the whole-host figures.
+      for (i = 1; i <= ng; i++) {
+        if (int_(u[i])) { su += u[i]; nu++; if (ng > 1) print "gpu" g[i] "_pct", u[i], "null", "null" }
+        if (int_(mu[i]) && int_(mt[i]) && mt[i] > 0) {
+          smu += mu[i]; smt += mt[i]
+          if (ng > 1) printf "gpu%s_vram_pct %.1f null null\n", g[i], 100 * mu[i] / mt[i]
+        }
+      }
+      if (nu) printf "gpu_pct %.1f null null\n", su / nu
+      if (smt) printf "vram_pct %.1f null null\n", 100 * smu / smt
+    }' || true
+}
+
+# CPU busy %, RAM %, load % and disk I/O. CPU and disk are averaged since the previous run (state file),
+# so the first run after install or after a long gap sends none of them.
+collect_usage() {
+  local up n l1 l5 l15 prev
+  read -r up _ </proc/uptime
+  read -r l1 l5 l15 _ </proc/loadavg
+  n=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo)
+  awk -v l1="$l1" -v n="$n" 'BEGIN { if (n > 0) printf "load_pct %.1f null null\n", 100 * l1 / n }'
+  awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 }
+       END { if (t) printf "mem_pct %.1f null 90\n", 100 * (t - a) / t }' /proc/meminfo
+
+  prev=$(cat "$STATE" 2>/dev/null || true)
+  {
+    echo "up $up"
+    # /proc/stat cpu: user nice system idle iowait irq softirq steal (guest time is already in user)
+    awk '$1 == "cpu" { print "cpu", $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9, $5 + $6; exit }' /proc/stat
+    # Whole physical disks only (they have a device link; loop, zram, dm and md do not).
+    # /proc/diskstats: $3 name, $6 sectors read, $10 sectors written, $13 ms spent doing I/O
+    awk 'FNR == NR { ok[$1]; next } ($3 in ok) { print "disk", $3, $6, $10, $13 }' \
+      <(for b in /sys/block/*; do [[ -e $b/device ]] && echo "${b##*/}"; done) /proc/diskstats
+  } >"$STATE.tmp" 2>/dev/null && mv -f "$STATE.tmp" "$STATE" || return 0
+
+  { sed 's/^/P /' <<<"$prev"; sed 's/^/C /' "$STATE"; } | awk '
+    $2 == "up"   { up[$1] = $3 }
+    $2 == "cpu"  { tot[$1] = $3; idle[$1] = $4 }
+    $2 == "disk" { r[$1, $3] = $4; w[$1, $3] = $5; t[$1, $3] = $6; if ($1 == "C") d[$3] }
+    END {
+      dt = up["C"] - up["P"]
+      if (up["P"] == "" || dt <= 0 || dt > 900) exit     # first run, reboot, or stale state
+      if (tot["C"] > tot["P"])
+        printf "cpu_pct %.1f null null\n", 100 * (1 - (idle["C"] - idle["P"]) / (tot["C"] - tot["P"]))
+      for (k in d) {
+        if (!(("P", k) in r) || r["C", k] < r["P", k] || w["C", k] < w["P", k] || t["C", k] < t["P", k]) continue
+        nd++; rs += r["C", k] - r["P", k]; ws += w["C", k] - w["P", k]
+        b = (t["C", k] - t["P", k]) / (dt * 10); if (b > mb) mb = b
+      }
+      if (nd) {
+        printf "disk_read_mbs %.2f null null\n", rs * 512 / 1e6 / dt
+        printf "disk_write_mbs %.2f null null\n", ws * 512 / 1e6 / dt
+        printf "disk_busy_pct %.1f null null\n", (mb > 100 ? 100 : mb)
+      }
+    }'
+}
+
+# Facts shown as text on the page, not graphed.
+host_info() {
+  local up n l1 l5 l15
+  read -r up _ </proc/uptime
+  read -r l1 l5 l15 _ </proc/loadavg
+  n=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo)
+  awk -v up="$up" -v n="$n" -v l1="$l1" -v l5="$l5" -v l15="$l15" '/^MemTotal:/ { t = $2 }
+    END { printf "\"uptime\":%d,\"ncpu\":%d,\"mem_gb\":%.1f,\"load1\":%s,\"load5\":%s,\"load15\":%s",
+                 up, n, t / 1048576, l1, l5, l15 }' /proc/meminfo
 }
 
 # Merge, keep the first occurrence of a name, put the defaults first, build JSON (key order is kept).
-payload=$({ collect_ipmi; collect_hwmon; collect_nvidia; } | awk -v defaults="${PULSE_DEFAULTS:-${PULSE_FIRST:-}}" '
+# Usage figures the page always shows by default, after the temperature defaults.
+USAGE_DEFAULTS="cpu_pct mem_pct load_pct gpu_pct vram_pct disk_busy_pct disk_read_mbs disk_write_mbs"
+payload=$({ collect_ipmi; collect_hwmon; collect_nvidia; collect_usage; } | awk \
+  -v defaults="${PULSE_DEFAULTS:-${PULSE_FIRST:-}}" -v usage="$USAGE_DEFAULTS" -v info="$(host_info)" '
   function num(x) { return x ~ /^-?[0-9]+(\.[0-9]+)?$/ }
   function add(i) {
     m = m (m ? "," : "") "\"" name[i] "\":" val[i]
@@ -109,16 +188,19 @@ payload=$({ collect_ipmi; collect_hwmon; collect_nvidia; } | awk -v defaults="${
   END {
     if (!n) exit
     nd = split(defaults, want, /[ ,]+/)
+    if (!idx[want[1]] && nd <= 1) { nd = 1; want[1] = name[1] }   # no PULSE_DEFAULTS: first metric sent
+    nu = split(usage, extra, / /)
+    for (j = 1; j <= nu; j++) want[++nd] = extra[j]
     for (j = 1; j <= nd; j++) {
       i = idx[want[j]]
       if (i && !done[i]++) { add(i); d = d (d ? "," : "") "\"" name[i] "\"" }
     }
     for (i = 1; i <= n; i++) if (!done[i]) add(i)
-    printf "{\"metrics\":{%s},\"limits\":{%s},\"defaults\":[%s]}", m, l, d
+    printf "{\"metrics\":{%s},\"limits\":{%s},\"defaults\":[%s],\"info\":{%s}}", m, l, d, info
   }')
 
 if [[ -z $payload ]]; then
-  echo "pulse-agent: no temperature sensors found" >&2
+  echo "pulse-agent: nothing to send" >&2
   exit 1
 fi
 

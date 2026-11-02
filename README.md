@@ -1,6 +1,6 @@
 # pulse
 
-Lean temperature + online-status monitor.
+Lean temperature, usage + online-status monitor.
 
 ```
 [server] cron agent --HTTPS POST /pulse/ingest (bearer token)--> [VPS reverse proxy] --VPN--> [homeserver: pulse_server container]
@@ -43,8 +43,23 @@ Pushes every temperature the host exposes, each with its own limits:
 | `/sys/class/hwmon` (same data `lm-sensors` reads) | `k10temp_tctl`, `nvme_composite`, … | min/lcrit..crit/max when the driver sets them |
 | `nvidia-smi` | `nvidia_gpu0`, … | current + `tlimit` headroom (max operating temp) |
 
-The page shows `system` by default; tick other sensors under "Sensors" on each host card (remembered per browser).
-Readings outside their limits turn red. Missing sources are skipped.
+Plus usage, from `/proc` and `nvidia-smi`:
+
+| Metric | Meaning |
+|---|---|
+| `cpu_pct` | CPU busy time across all cores since the previous push |
+| `mem_pct` | RAM in use, page cache excluded (limit 90) |
+| `load_pct` | 1-min load average ÷ cores (100 = every core has work; above = tasks waiting) |
+| `gpu_pct`, `vram_pct` | GPU busy time and memory allocated, averaged over all GPUs; `gpu<N>_pct`, `gpu<N>_vram_pct` per GPU on multi-GPU hosts |
+| `disk_busy_pct` | share of time the busiest physical disk had I/O in flight |
+| `disk_read_mbs`, `disk_write_mbs` | MB/s summed over physical disks |
+
+Uptime, cores, RAM size and raw load 1/5/15 go as `info` and show as a text line. CPU and disk figures are deltas
+against a state file (`.pulse-state` next to the script), so the first push after install has none of them.
+
+The page draws one chart per kind (temperature °C, usage %, disk MB/s), each with a caption saying what the range means.
+It shows the host's `PULSE_DEFAULTS` plus the usage aggregates by default; tick other metrics under "Sensors" on each
+host card (remembered per browser). Readings outside their limits turn red. Missing sources are skipped.
 
 Needs `bash`, `curl`, `awk`; for BMC sensors also `ipmitool` and one narrow sudo rule (cron cannot type a password):
 
@@ -78,7 +93,7 @@ The sudo rule allows exactly `ipmitool sensor` with no arguments, a read-only li
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/ingest` | `Authorization: Bearer <token>`, body `{"metrics":{"system":37},"limits":{"system":[5,85]}}` (`limits` optional), names `[a-z0-9_-]`, values -100..250, max 128 metrics; either limit may be `null` |
+| POST | `/ingest` | `Authorization: Bearer <token>`, body `{"metrics":{"system":37},"limits":{"system":[5,85]}}` (`limits`, `defaults`, `info` optional), names `[a-z0-9_-]`, values -100..100000, max 192 metrics; either limit may be `null`. Names ending `_pct` are percent, `_mbs` MB/s, others °C |
 | GET | `/api/status` | all hosts, online flag, latest values |
 | GET | `/api/history?host=engg-ai-server&hours=24&metrics=system,gpu3` | `hours` 1..168, `metrics` optional filter |
 | GET | `/healthz` | container healthcheck |

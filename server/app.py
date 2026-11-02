@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pulse server: receives temperature pushes, stores them in SQLite, serves a status page.
+"""pulse server: receives temperature and usage pushes, stores them in SQLite, serves a status page.
 
 Stdlib only. Config via environment:
   PULSE_TOKENS          "host1=token1,host2=token2"  (token decides which host a push belongs to)
@@ -62,7 +62,10 @@ def record_fail():
         _fails.append(time.time())
 
 MAX_BODY = 16384
-MAX_METRICS = 128
+MAX_METRICS = 192
+# Values: °C for temperatures, percent for *_pct, MB/s for *_mbs (disk throughput can exceed 250).
+VALUE_MIN, VALUE_MAX = -100, 100000
+MAX_INFO = 16
 MAX_HOURS = 24 * 7
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 INDEX_HTML = (Path(__file__).parent / "index.html").read_bytes()
@@ -105,28 +108,30 @@ class Store:
                 self.db.execute("ALTER TABLE hosts ADD COLUMN metric_order TEXT")
             if "defaults" not in cols:
                 self.db.execute("ALTER TABLE hosts ADD COLUMN defaults TEXT")
+            if "info" not in cols:
+                self.db.execute("ALTER TABLE hosts ADD COLUMN info TEXT")
 
-    def insert(self, host, ts, metrics, limits, defaults):
+    def insert(self, host, ts, metrics, limits, defaults, info):
         with self.lock:
             self.db.execute("BEGIN")
             self.db.executemany(
                 "INSERT INTO samples VALUES (?, ?, ?, ?)", [(host, ts, k, v) for k, v in metrics.items()]
             )
             self.db.execute(
-                "INSERT INTO hosts (host, last_seen, limits, metric_order, defaults) VALUES (?, ?, ?, ?, ?) "
+                "INSERT INTO hosts (host, last_seen, limits, metric_order, defaults, info) VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(host) DO UPDATE SET last_seen = excluded.last_seen, limits = excluded.limits, "
-                "metric_order = excluded.metric_order, defaults = excluded.defaults",
-                (host, ts, json.dumps(limits), json.dumps(list(metrics)), json.dumps(defaults)),
+                "metric_order = excluded.metric_order, defaults = excluded.defaults, info = excluded.info",
+                (host, ts, json.dumps(limits), json.dumps(list(metrics)), json.dumps(defaults), json.dumps(info)),
             )
             self.db.execute("COMMIT")
 
     def status(self, now):
         with self.lock:
             hosts = self.db.execute(
-                "SELECT host, last_seen, limits, metric_order, defaults FROM hosts ORDER BY host"
+                "SELECT host, last_seen, limits, metric_order, defaults, info FROM hosts ORDER BY host"
             ).fetchall()
             out = []
-            for host, last_seen, limits, order, defaults in hosts:
+            for host, last_seen, limits, order, defaults, info in hosts:
                 rows = self.db.execute(
                     "SELECT metric, value FROM samples WHERE host = ? AND ts = ?", (host, last_seen)
                 ).fetchall()
@@ -140,10 +145,12 @@ class Store:
                     "order": [m for m in json.loads(order or "[]") if m in dict(rows)] or sorted(dict(rows)),
                     # Sensors the agent wants shown by default (PULSE_DEFAULTS); empty = first in order.
                     "defaults": [m for m in json.loads(defaults or "[]") if m in dict(rows)],
+                    # Uptime, cores, RAM size, raw load: text facts from the last push.
+                    "info": json.loads(info or "{}"),
                 })
         # Hosts configured but never seen still show up, as offline.
         seen = {h["host"] for h in out}
-        out += [{"host": h, "last_seen": None, "online": False, "latest": {}, "limits": {}, "order": [], "defaults": []} for h in sorted(TOKENS) if h not in seen]
+        out += [{"host": h, "last_seen": None, "online": False, "latest": {}, "limits": {}, "order": [], "defaults": [], "info": {}} for h in sorted(TOKENS) if h not in seen]
         return out
 
     def history(self, host, since, only=None):
@@ -189,7 +196,7 @@ def parse_metrics(body):
     for k, v in metrics.items():
         if not isinstance(k, str) or not NAME_RE.match(k):
             raise ValueError(f"bad metric name {k!r}")
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not -100 <= v <= 250:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not VALUE_MIN <= v <= VALUE_MAX:
             raise ValueError(f"bad value for {k}")
         clean[k] = round(float(v), 2)
     # Optional per-metric safe range as reported by the sensor, e.g. {"system": [5, 85]}; either end may be null.
@@ -199,7 +206,7 @@ def parse_metrics(body):
         raise ValueError("'limits' must be an object")
     for k, rng in raw.items():
         if k not in clean or not isinstance(rng, list) or len(rng) != 2 or not all(
-            x is None or (isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and -100 <= x <= 250)
+            x is None or (isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and VALUE_MIN <= x <= VALUE_MAX)
             for x in rng
         ) or rng == [None, None]:
             raise ValueError(f"bad limits for {k!r}")
@@ -209,7 +216,17 @@ def parse_metrics(body):
     if not isinstance(defaults, list) or len(defaults) > MAX_METRICS:
         raise ValueError("'defaults' must be a list of metric names")
     defaults = list(dict.fromkeys(d for d in defaults if isinstance(d, str) and d in clean))
-    return clean, limits, defaults
+    # Optional host facts shown as text, e.g. {"uptime": 86400, "ncpu": 32, "mem_gb": 62.7, "load1": 0.5}.
+    raw = data.get("info") or {}
+    if not isinstance(raw, dict) or len(raw) > MAX_INFO:
+        raise ValueError(f"'info' must be an object with at most {MAX_INFO} entries")
+    info = {}
+    for k, v in raw.items():
+        if not NAME_RE.match(k) or isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) \
+                or not 0 <= v <= 1e10:
+            raise ValueError(f"bad info {k!r}")
+        info[k] = v
+    return clean, limits, defaults, info
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -321,11 +338,11 @@ class Handler(BaseHTTPRequestHandler):
         if not 0 < length <= MAX_BODY:
             return self._send(413, {"error": "body too large or empty"})
         try:
-            metrics, limits, defaults = parse_metrics(self.rfile.read(length))
+            metrics, limits, defaults, info = parse_metrics(self.rfile.read(length))
         except (ValueError, json.JSONDecodeError) as e:
             return self._send(400, {"error": str(e)})
         # Server clock is the source of truth; agent clocks may drift.
-        STORE.insert(host, int(time.time()), metrics, limits, defaults)
+        STORE.insert(host, int(time.time()), metrics, limits, defaults, info)
         self._send(200, {"ok": True, "host": host})
 
 
