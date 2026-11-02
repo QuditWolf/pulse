@@ -61,8 +61,8 @@ def record_fail():
     with _fails_lock:
         _fails.append(time.time())
 
-MAX_BODY = 8192
-MAX_METRICS = 64
+MAX_BODY = 16384
+MAX_METRICS = 128
 MAX_HOURS = 24 * 7
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 INDEX_HTML = (Path(__file__).parent / "index.html").read_bytes()

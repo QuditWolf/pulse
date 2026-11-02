@@ -69,7 +69,7 @@ The sudo rule allows exactly `ipmitool sensor` with no arguments, a read-only li
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/ingest` | `Authorization: Bearer <token>`, body `{"metrics":{"system":37},"limits":{"system":[5,85]}}` (`limits` optional), names `[a-z0-9_-]`, values -100..250, max 64 metrics; either limit may be `null` |
+| POST | `/ingest` | `Authorization: Bearer <token>`, body `{"metrics":{"system":37},"limits":{"system":[5,85]}}` (`limits` optional), names `[a-z0-9_-]`, values -100..250, max 128 metrics; either limit may be `null` |
 | GET | `/api/status` | all hosts, online flag, latest values |
 | GET | `/api/history?host=engg-ai-server&hours=24&metrics=system,gpu3` | `hours` 1..168, `metrics` optional filter |
 | GET | `/healthz` | container healthcheck |
