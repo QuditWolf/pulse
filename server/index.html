@@ -118,7 +118,8 @@ function getSel(h) {
   try { sel = JSON.parse(localStorage.getItem("pulse.sel." + h.host)); } catch (e) {}
   if (!Array.isArray(sel)) sel = [];
   sel = sel.filter(m => m in h.latest);
-  if (!sel.length) sel = order(h).slice(0, 1);   // default: the first metric the agent sent
+  // Default: the agent's PULSE_DEFAULTS list, else the first metric it sent.
+  if (!sel.length) sel = (h.defaults && h.defaults.length) ? h.defaults.slice() : order(h).slice(0, 1);
   return sel;
 }
 function setSel(host, sel) {

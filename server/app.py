@@ -103,26 +103,30 @@ class Store:
                 self.db.execute("ALTER TABLE hosts ADD COLUMN limits TEXT")
             if "metric_order" not in cols:
                 self.db.execute("ALTER TABLE hosts ADD COLUMN metric_order TEXT")
+            if "defaults" not in cols:
+                self.db.execute("ALTER TABLE hosts ADD COLUMN defaults TEXT")
 
-    def insert(self, host, ts, metrics, limits):
+    def insert(self, host, ts, metrics, limits, defaults):
         with self.lock:
             self.db.execute("BEGIN")
             self.db.executemany(
                 "INSERT INTO samples VALUES (?, ?, ?, ?)", [(host, ts, k, v) for k, v in metrics.items()]
             )
             self.db.execute(
-                "INSERT INTO hosts (host, last_seen, limits, metric_order) VALUES (?, ?, ?, ?) "
+                "INSERT INTO hosts (host, last_seen, limits, metric_order, defaults) VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(host) DO UPDATE SET last_seen = excluded.last_seen, limits = excluded.limits, "
-                "metric_order = excluded.metric_order",
-                (host, ts, json.dumps(limits), json.dumps(list(metrics))),
+                "metric_order = excluded.metric_order, defaults = excluded.defaults",
+                (host, ts, json.dumps(limits), json.dumps(list(metrics)), json.dumps(defaults)),
             )
             self.db.execute("COMMIT")
 
     def status(self, now):
         with self.lock:
-            hosts = self.db.execute("SELECT host, last_seen, limits, metric_order FROM hosts ORDER BY host").fetchall()
+            hosts = self.db.execute(
+                "SELECT host, last_seen, limits, metric_order, defaults FROM hosts ORDER BY host"
+            ).fetchall()
             out = []
-            for host, last_seen, limits, order in hosts:
+            for host, last_seen, limits, order, defaults in hosts:
                 rows = self.db.execute(
                     "SELECT metric, value FROM samples WHERE host = ? AND ts = ?", (host, last_seen)
                 ).fetchall()
@@ -134,10 +138,12 @@ class Store:
                     "limits": json.loads(limits or "{}"),
                     # Order the agent sent them in; the first one is the page's default.
                     "order": [m for m in json.loads(order or "[]") if m in dict(rows)] or sorted(dict(rows)),
+                    # Sensors the agent wants shown by default (PULSE_DEFAULTS); empty = first in order.
+                    "defaults": [m for m in json.loads(defaults or "[]") if m in dict(rows)],
                 })
         # Hosts configured but never seen still show up, as offline.
         seen = {h["host"] for h in out}
-        out += [{"host": h, "last_seen": None, "online": False, "latest": {}, "limits": {}, "order": []} for h in sorted(TOKENS) if h not in seen]
+        out += [{"host": h, "last_seen": None, "online": False, "latest": {}, "limits": {}, "order": [], "defaults": []} for h in sorted(TOKENS) if h not in seen]
         return out
 
     def history(self, host, since, only=None):
@@ -198,7 +204,12 @@ def parse_metrics(body):
         ) or rng == [None, None]:
             raise ValueError(f"bad limits for {k!r}")
         limits[k] = [None if x is None else float(x) for x in rng]
-    return clean, limits
+    # Optional list of metric names the page shows by default.
+    defaults = data.get("defaults") or []
+    if not isinstance(defaults, list) or len(defaults) > MAX_METRICS:
+        raise ValueError("'defaults' must be a list of metric names")
+    defaults = list(dict.fromkeys(d for d in defaults if isinstance(d, str) and d in clean))
+    return clean, limits, defaults
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -310,11 +321,11 @@ class Handler(BaseHTTPRequestHandler):
         if not 0 < length <= MAX_BODY:
             return self._send(413, {"error": "body too large or empty"})
         try:
-            metrics, limits = parse_metrics(self.rfile.read(length))
+            metrics, limits, defaults = parse_metrics(self.rfile.read(length))
         except (ValueError, json.JSONDecodeError) as e:
             return self._send(400, {"error": str(e)})
         # Server clock is the source of truth; agent clocks may drift.
-        STORE.insert(host, int(time.time()), metrics, limits)
+        STORE.insert(host, int(time.time()), metrics, limits, defaults)
         self._send(200, {"ok": True, "host": host})
 
 

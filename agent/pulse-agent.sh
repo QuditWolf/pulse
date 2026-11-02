@@ -7,14 +7,17 @@
 #   /sys/class/hwmon        -> "<driver>_<label>", e.g. "k10temp_tctl", "nvme_composite"   limits: min/lcrit..crit/max
 #                              drivers with several instances get a number: "coretemp_0_core_0", "coretemp_1_core_0"
 #   nvidia-smi              -> "nvidia_gpu<N>"   limit: current + tlimit headroom (max operating temp)
+#                              plus "nvidia_gpu_max" (hottest GPU) when there is more than one GPU
 # (lm-sensors' `sensors` reads the same /sys/class/hwmon data, so it is not needed.)
 #
 # ipmitool needs root; allow exactly this read-only command in sudoers:
 #   <user> ALL=(root) NOPASSWD: /usr/bin/ipmitool sensor
 # Config: pulse-agent.env next to this script.
 #   PULSE_URL, PULSE_TOKEN   required
-#   PULSE_FIRST              optional metric name to send first. The first metric sent is what the page
-#                            shows by default; without it the order is ipmitool, hwmon, nvidia-smi.
+#   PULSE_DEFAULTS           optional comma list of metrics the page shows by default, e.g.
+#                            "system,cpu,nvidia_gpu0". They are sent first, in this order. Without it the
+#                            page shows only the first metric sent (order: ipmitool, hwmon, nvidia-smi).
+#   PULSE_FIRST              older single-metric form of PULSE_DEFAULTS.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -78,16 +81,18 @@ collect_hwmon() {
 collect_nvidia() {
   command -v nvidia-smi >/dev/null 2>&1 || return 0
   timeout 15 nvidia-smi --query-gpu=index,temperature.gpu,temperature.gpu.tlimit \
-    --format=csv,noheader,nounits 2>/dev/null | while IFS=', ' read -r idx temp tlimit; do
-      [[ $idx =~ ^[0-9]+$ && $temp =~ ^[0-9]+$ ]] || continue
-      hi=null
-      [[ $tlimit =~ ^-?[0-9]+$ ]] && hi=$((temp + tlimit))
-      echo "nvidia_gpu$idx $temp null $hi"
-    done || true
+    --format=csv,noheader,nounits 2>/dev/null | awk -F', *' '
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+      hi = ($3 ~ /^-?[0-9]+$/) ? $2 + $3 : "null"
+      print "nvidia_gpu" $1, $2, "null", hi
+      if (!n++ || $2 + 0 > mx) mx = $2 + 0
+      if (hi != "null" && (mh == "" || hi < mh)) mh = hi
+    }
+    END { if (n > 1) print "nvidia_gpu_max", mx, "null", (mh == "" ? "null" : mh) }' || true
 }
 
-# Merge, keep the first occurrence of a name, put PULSE_FIRST first, build JSON (key order is kept).
-payload=$({ collect_ipmi; collect_hwmon; collect_nvidia; } | awk -v first="${PULSE_FIRST:-}" '
+# Merge, keep the first occurrence of a name, put the defaults first, build JSON (key order is kept).
+payload=$({ collect_ipmi; collect_hwmon; collect_nvidia; } | awk -v defaults="${PULSE_DEFAULTS:-${PULSE_FIRST:-}}" '
   function num(x) { return x ~ /^-?[0-9]+(\.[0-9]+)?$/ }
   function add(i) {
     m = m (m ? "," : "") "\"" name[i] "\":" val[i]
@@ -96,14 +101,17 @@ payload=$({ collect_ipmi; collect_hwmon; collect_nvidia; } | awk -v first="${PUL
   }
   # No {m,n} regex intervals: mawk (Debian/Ubuntu default awk) does not support them.
   $1 ~ /^[a-z0-9][a-z0-9_-]*$/ && length($1) <= 32 && num($2) && !seen[$1]++ {
-    n++; name[n] = $1; val[n] = $2; lo[n] = $3; hi[n] = $4
-    if ($1 == first) fi = n
+    n++; name[n] = $1; val[n] = $2; lo[n] = $3; hi[n] = $4; idx[$1] = n
   }
   END {
     if (!n) exit
-    if (fi) add(fi)
-    for (i = 1; i <= n; i++) if (i != fi) add(i)
-    printf "{\"metrics\":{%s},\"limits\":{%s}}", m, l
+    nd = split(defaults, want, /[ ,]+/)
+    for (j = 1; j <= nd; j++) {
+      i = idx[want[j]]
+      if (i && !done[i]++) { add(i); d = d (d ? "," : "") "\"" name[i] "\"" }
+    }
+    for (i = 1; i <= n; i++) if (!done[i]) add(i)
+    printf "{\"metrics\":{%s},\"limits\":{%s},\"defaults\":[%s]}", m, l, d
   }')
 
 if [[ -z $payload ]]; then
