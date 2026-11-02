@@ -2,3 +2,5 @@
 *.db
 *.db-*
 agent/pulse-agent.env
+kelper_pulse-probe.txt
+*-probe.txt

@@ -63,6 +63,15 @@ chmod 600 ~/scripts/pulse/pulse-agent.env && $EDITOR ~/scripts/pulse/pulse-agent
 ( crontab -l 2>/dev/null; echo '* * * * * $HOME/scripts/pulse/pulse-agent.sh >/dev/null 2>>$HOME/scripts/pulse/agent.err' ) | crontab -
 ```
 
+No cron (e.g. Arch)? As root, install as a systemd timer under `/opt/pulse-agent` (rerun without vars to update the script):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/QuditWolf/pulse/main/agent/install-systemd.sh \
+  | PULSE_URL=https://quditwolf.qutrit.org/pulse PULSE_TOKEN=<token> bash
+```
+
+Check what a host exposes first: `curl -fsSL https://raw.githubusercontent.com/QuditWolf/pulse/main/agent/pulse-probe.sh | bash` (read-only).
+
 The sudo rule allows exactly `ipmitool sensor` with no arguments, a read-only listing; `ipmitool sensor thresh …` stays blocked.
 
 ## API
