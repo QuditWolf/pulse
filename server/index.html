@@ -42,6 +42,12 @@
   .chart h3 { margin: 0 0 4px; font-size: 13px; font-weight: 600; }
   .chart .cap { margin: 4px 0 0; font-size: 12px; color: var(--muted); line-height: 1.45; }
   .chart .cap b { color: var(--fg); font-weight: 600; }
+  .chart .now { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 2px 0 6px; font-size: 13px;
+                font-variant-numeric: tabular-nums; }
+  .chart .now span { display: inline-flex; align-items: baseline; gap: 5px; }
+  .chart .now i { width: 9px; height: 9px; border-radius: 2px; align-self: center; }
+  .chart .now small { color: var(--muted); }
+  .chart .now b { font-size: 15px; }
   .uplot { font-family: inherit; }
   .u-legend { color: var(--fg); font-size: 12px; }
 
@@ -194,7 +200,7 @@ function renderHead(c, h, sel, now) {
   c.querySelector(".state").textContent = (h.online ? "online" : "offline") +
     (h.last_seen ? " · " + ago(now - h.last_seen) : " · never seen");
   const temps = c.querySelector(".temps"); temps.textContent = "";
-  for (const m of order(h).filter(x => sel.includes(x))) {
+  for (const m of order(h).filter(x => sel.includes(x) && kind(x) === "temp")) {
     const v = h.latest[m], lim = (h.limits || {})[m];
     const s = el("span"), b = el("b", null, show(m, v));
     if (outOfRange(v, lim)) b.style.color = css("--bad");
@@ -244,7 +250,8 @@ function renderSensors(c, h, sel) {
 }
 
 // One chart per kind (temperature, usage %, disk MB/s), each only when a metric of that kind is selected.
-function renderCharts(c, host, data, sel) {
+function renderCharts(c, h, data, sel) {
+  const host = h.host;
   const wrap = c.querySelector(".charts");
   for (const k of Object.keys(KINDS)) {
     const id = host + "|" + k;
@@ -253,11 +260,22 @@ function renderCharts(c, host, data, sel) {
     if (!metrics.length) { if (charts[id]) { charts[id].u.destroy(); delete charts[id]; } if (box) box.remove(); continue; }
     if (!box) {
       box = el("div", "chart"); box.dataset.k = k;
-      box.append(el("h3", null, `${KINDS[k].title} (${KINDS[k].unit.trim()})`), el("div", "plot"), el("p", "cap"));
+      box.append(el("h3", null, `${KINDS[k].title} (${KINDS[k].unit.trim()})`), el("div", "now"), el("div", "plot"), el("p", "cap"));
       // Keep the order temperature, usage, disk regardless of when each appears.
       const after = [...wrap.children].find(x => Object.keys(KINDS).indexOf(x.dataset.k) > Object.keys(KINDS).indexOf(k));
       wrap.insertBefore(box, after || null);
     }
+    // Latest value of each line, always visible (temperatures already show in the host header).
+    const now = box.querySelector(".now"); now.textContent = "";
+    if (k !== "temp") metrics.forEach((m, i) => {
+      if (!(m in h.latest)) return;
+      const v = h.latest[m], sw = el("i"), b = el("b", null, show(m, v));
+      sw.style.background = COLORS[i % COLORS.length];
+      if (outOfRange(v, (h.limits || {})[m])) b.style.color = css("--bad");
+      const s = el("span"); s.append(sw, el("small", null, label(m)), b);
+      if (!h.online) s.style.opacity = 0.5;
+      now.append(s);
+    });
     const cap = box.querySelector(".cap"); cap.textContent = "";
     if (k === "pct") {
       const seen = new Set();
@@ -303,7 +321,7 @@ async function renderHost(h, now, force) {
   const key = [h.last_seen, hours, sel.join(","), Math.floor(Date.now() / 60000)].join("|");
   if (!force && drawnKey[h.host] === key) return;
   const q = `api/history?host=${encodeURIComponent(h.host)}&hours=${hours}&metrics=${encodeURIComponent(sel.join(","))}`;
-  renderCharts(c, h.host, await api(q), sel);
+  renderCharts(c, h, await api(q), sel);
   drawnKey[h.host] = key;
 }
 
