@@ -77,7 +77,8 @@ collect_nvidia() {
 # Merge, keep the first occurrence of a name, build JSON.
 payload=$({ collect_ipmi; collect_hwmon; collect_nvidia; } | awk '
   function num(x) { return x ~ /^-?[0-9]+(\.[0-9]+)?$/ }
-  $1 ~ /^[a-z0-9][a-z0-9_-]{0,31}$/ && num($2) && !seen[$1]++ {
+  # No {m,n} regex intervals: mawk (Debian/Ubuntu default awk) does not support them.
+  $1 ~ /^[a-z0-9][a-z0-9_-]*$/ && length($1) <= 32 && num($2) && !seen[$1]++ {
     m = m (m ? "," : "") "\"" $1 "\":" $2
     if ($3 != "null" || $4 != "null")
       l = l (l ? "," : "") "\"" $1 "\":[" $3 "," $4 "]"
