@@ -7,7 +7,6 @@ Stdlib only. Config via environment:
   PULSE_PORT            listen port (default 8080)
   PULSE_OFFLINE_AFTER   seconds without a push before a host counts as offline (default 180)
   PULSE_RETENTION_DAYS  days of history to keep (default 30)
-  PULSE_LIMITS          per-metric safe range shown on the page, "system=5:85,cpu=0:95"
   PULSE_PASSWORD        if set, page + API need HTTP Basic auth with this password (any username)
 """
 import base64
@@ -30,20 +29,6 @@ OFFLINE_AFTER = int(os.environ.get("PULSE_OFFLINE_AFTER", "180"))
 RETENTION_DAYS = int(os.environ.get("PULSE_RETENTION_DAYS", "30"))
 PASSWORD = os.environ.get("PULSE_PASSWORD", "")
 
-
-def load_limits():
-    limits = {}
-    for pair in filter(None, (p.strip() for p in os.environ.get("PULSE_LIMITS", "").split(","))):
-        name, _, rng = pair.partition("=")
-        lo, _, hi = rng.partition(":")
-        try:
-            limits[name.strip()] = [float(lo), float(hi)]
-        except ValueError:
-            sys.exit(f"bad PULSE_LIMITS entry {pair!r}: need name=low:high")
-    return limits
-
-
-LIMITS = load_limits()
 MAX_BODY = 4096
 MAX_METRICS = 32
 MAX_HOURS = 24 * 7
@@ -79,24 +64,28 @@ class Store:
             )
             self.db.execute("CREATE INDEX IF NOT EXISTS samples_host_ts ON samples (host, ts)")
             self.db.execute("CREATE TABLE IF NOT EXISTS hosts (host TEXT PRIMARY KEY, last_seen INTEGER)")
+            cols = {r[1] for r in self.db.execute("PRAGMA table_info(hosts)")}
+            if "limits" not in cols:
+                self.db.execute("ALTER TABLE hosts ADD COLUMN limits TEXT")
 
-    def insert(self, host, ts, metrics):
+    def insert(self, host, ts, metrics, limits):
         with self.lock:
             self.db.execute("BEGIN")
             self.db.executemany(
                 "INSERT INTO samples VALUES (?, ?, ?, ?)", [(host, ts, k, v) for k, v in metrics.items()]
             )
             self.db.execute(
-                "INSERT INTO hosts VALUES (?, ?) ON CONFLICT(host) DO UPDATE SET last_seen = excluded.last_seen",
-                (host, ts),
+                "INSERT INTO hosts (host, last_seen, limits) VALUES (?, ?, ?) "
+                "ON CONFLICT(host) DO UPDATE SET last_seen = excluded.last_seen, limits = excluded.limits",
+                (host, ts, json.dumps(limits)),
             )
             self.db.execute("COMMIT")
 
     def status(self, now):
         with self.lock:
-            hosts = self.db.execute("SELECT host, last_seen FROM hosts ORDER BY host").fetchall()
+            hosts = self.db.execute("SELECT host, last_seen, limits FROM hosts ORDER BY host").fetchall()
             out = []
-            for host, last_seen in hosts:
+            for host, last_seen, limits in hosts:
                 rows = self.db.execute(
                     "SELECT metric, value FROM samples WHERE host = ? AND ts = ?", (host, last_seen)
                 ).fetchall()
@@ -105,10 +94,11 @@ class Store:
                     "last_seen": last_seen,
                     "online": now - last_seen <= OFFLINE_AFTER,
                     "latest": dict(rows),
+                    "limits": json.loads(limits or "{}"),
                 })
         # Hosts configured but never seen still show up, as offline.
         seen = {h["host"] for h in out}
-        out += [{"host": h, "last_seen": None, "online": False, "latest": {}} for h in sorted(TOKENS) if h not in seen]
+        out += [{"host": h, "last_seen": None, "online": False, "latest": {}, "limits": {}} for h in sorted(TOKENS) if h not in seen]
         return out
 
     def history(self, host, since):
@@ -154,7 +144,19 @@ def parse_metrics(body):
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not -100 <= v <= 250:
             raise ValueError(f"bad value for {k}")
         clean[k] = round(float(v), 2)
-    return clean
+    # Optional per-metric safe range as reported by the sensor, e.g. {"system": [5, 85]}.
+    limits = {}
+    raw = data.get("limits") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("'limits' must be an object")
+    for k, rng in raw.items():
+        if k not in clean or not isinstance(rng, list) or len(rng) != 2 or not all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and -100 <= x <= 250
+            for x in rng
+        ):
+            raise ValueError(f"bad limits for {k!r}")
+        limits[k] = [float(rng[0]), float(rng[1])]
+    return clean, limits
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -200,7 +202,7 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/":
             return self._send(200, INDEX_HTML, "text/html; charset=utf-8", "max-age=60")
         if url.path == "/api/status":
-            return self._send(200, {"now": int(time.time()), "offline_after": OFFLINE_AFTER, "limits": LIMITS,
+            return self._send(200, {"now": int(time.time()), "offline_after": OFFLINE_AFTER,
                                     "hosts": STORE.status(int(time.time()))})
         if url.path == "/api/history":
             q = parse_qs(url.query)
@@ -229,11 +231,11 @@ class Handler(BaseHTTPRequestHandler):
         if not 0 < length <= MAX_BODY:
             return self._send(413, {"error": "body too large or empty"})
         try:
-            metrics = parse_metrics(self.rfile.read(length))
+            metrics, limits = parse_metrics(self.rfile.read(length))
         except (ValueError, json.JSONDecodeError) as e:
             return self._send(400, {"error": str(e)})
         # Server clock is the source of truth; agent clocks may drift.
-        STORE.insert(host, int(time.time()), metrics)
+        STORE.insert(host, int(time.time()), metrics, limits)
         self._send(200, {"ok": True, "host": host})
 
 

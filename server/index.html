@@ -110,7 +110,7 @@ async function refresh() {
         (h.last_seen ? " · " + ago(st.now - h.last_seen) : " · never seen");
       const temps = c.querySelector(".temps"); temps.textContent = "";
       for (const [m, v] of Object.entries(h.latest).sort()) {
-        const s = el("span"), lim = (st.limits || {})[m];
+        const s = el("span"), lim = (h.limits || {})[m];
         const b = el("b", null, v.toFixed(0) + "°C");
         s.append(el("small", null, label(m)), b);
         if (lim) {
