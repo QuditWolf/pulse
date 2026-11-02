@@ -35,9 +35,18 @@ Page: `https://quditwolf.qutrit.org/pulse/` (in-page login form; session cookie 
 
 ## 3. Monitored server (cron, no install)
 
-Reads the BMC `System Temp` sensor and its critical thresholds (LCR..UCR) via `ipmitool sensor`,
-and pushes them as `system`. The page shows each sensor's own range and turns the reading red outside it.
-Needs `bash`, `curl`, `ipmitool`, and one narrow sudo rule (cron cannot type a password):
+Pushes every temperature the host exposes, each with its own limits:
+
+| Source | Metric names | Limits |
+|---|---|---|
+| `ipmitool sensor` (BMC) | `system`, `cpu`, `gpu3`, `dimma_f`, … | LCR..UCR (fallback LNR..UNR) |
+| `/sys/class/hwmon` (same data `lm-sensors` reads) | `k10temp_tctl`, `nvme_composite`, … | min/lcrit..crit/max when the driver sets them |
+| `nvidia-smi` | `nvidia_gpu0`, … | current + `tlimit` headroom (max operating temp) |
+
+The page shows `system` by default; tick other sensors under "Sensors" on each host card (remembered per browser).
+Readings outside their limits turn red. Missing sources are skipped.
+
+Needs `bash`, `curl`, `awk`; for BMC sensors also `ipmitool` and one narrow sudo rule (cron cannot type a password):
 
 ```bash
 echo "$USER ALL=(root) NOPASSWD: /usr/bin/ipmitool sensor" | sudo tee /etc/sudoers.d/pulse >/dev/null
@@ -54,16 +63,15 @@ chmod 600 ~/scripts/pulse/pulse-agent.env && $EDITOR ~/scripts/pulse/pulse-agent
 ( crontab -l 2>/dev/null; echo '* * * * * $HOME/scripts/pulse/pulse-agent.sh >/dev/null 2>>$HOME/scripts/pulse/agent.err' ) | crontab -
 ```
 
-Different sensor: set `PULSE_SENSOR="<name as in ipmitool sensor>"` and `PULSE_METRIC=<short name>` in the env file.
 The sudo rule allows exactly `ipmitool sensor` with no arguments, a read-only listing; `ipmitool sensor thresh …` stays blocked.
 
 ## API
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/ingest` | `Authorization: Bearer <token>`, body `{"metrics":{"system":37},"limits":{"system":[5,85]}}` (`limits` optional), names `[a-z0-9_-]`, values -100..250, max 32 metrics |
+| POST | `/ingest` | `Authorization: Bearer <token>`, body `{"metrics":{"system":37},"limits":{"system":[5,85]}}` (`limits` optional), names `[a-z0-9_-]`, values -100..250, max 64 metrics; either limit may be `null` |
 | GET | `/api/status` | all hosts, online flag, latest values |
-| GET | `/api/history?host=engg-ai-server&hours=24` | `hours` 1..168 |
+| GET | `/api/history?host=engg-ai-server&hours=24&metrics=system,gpu3` | `hours` 1..168, `metrics` optional filter |
 | GET | `/healthz` | container healthcheck |
 
 ## Run locally

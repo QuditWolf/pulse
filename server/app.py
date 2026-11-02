@@ -60,8 +60,8 @@ def record_fail():
     with _fails_lock:
         _fails.append(time.time())
 
-MAX_BODY = 4096
-MAX_METRICS = 32
+MAX_BODY = 8192
+MAX_METRICS = 64
 MAX_HOURS = 24 * 7
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 INDEX_HTML = (Path(__file__).parent / "index.html").read_bytes()
@@ -132,11 +132,14 @@ class Store:
         out += [{"host": h, "last_seen": None, "online": False, "latest": {}, "limits": {}} for h in sorted(TOKENS) if h not in seen]
         return out
 
-    def history(self, host, since):
+    def history(self, host, since, only=None):
+        sql = "SELECT ts, metric, value FROM samples WHERE host = ? AND ts >= ?"
+        args = [host, since]
+        if only:
+            sql += f" AND metric IN ({','.join('?' * len(only))})"
+            args += only
         with self.lock:
-            rows = self.db.execute(
-                "SELECT ts, metric, value FROM samples WHERE host = ? AND ts >= ? ORDER BY ts", (host, since)
-            ).fetchall()
+            rows = self.db.execute(sql + " ORDER BY ts", args).fetchall()
         metrics = sorted({m for _, m, _ in rows})
         by_ts = {}
         for ts, m, v in rows:
@@ -167,7 +170,7 @@ def parse_metrics(body):
     data = json.loads(body)
     metrics = data.get("metrics") if isinstance(data, dict) else None
     if not isinstance(metrics, dict) or not 0 < len(metrics) <= MAX_METRICS:
-        raise ValueError("need 'metrics' object with 1..32 entries")
+        raise ValueError(f"need 'metrics' object with 1..{MAX_METRICS} entries")
     clean = {}
     for k, v in metrics.items():
         if not isinstance(k, str) or not NAME_RE.match(k):
@@ -175,18 +178,18 @@ def parse_metrics(body):
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not -100 <= v <= 250:
             raise ValueError(f"bad value for {k}")
         clean[k] = round(float(v), 2)
-    # Optional per-metric safe range as reported by the sensor, e.g. {"system": [5, 85]}.
+    # Optional per-metric safe range as reported by the sensor, e.g. {"system": [5, 85]}; either end may be null.
     limits = {}
     raw = data.get("limits") or {}
     if not isinstance(raw, dict):
         raise ValueError("'limits' must be an object")
     for k, rng in raw.items():
         if k not in clean or not isinstance(rng, list) or len(rng) != 2 or not all(
-            isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and -100 <= x <= 250
+            x is None or (isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and -100 <= x <= 250)
             for x in rng
-        ):
+        ) or rng == [None, None]:
             raise ValueError(f"bad limits for {k!r}")
-        limits[k] = [float(rng[0]), float(rng[1])]
+        limits[k] = [None if x is None else float(x) for x in rng]
     return clean, limits
 
 
@@ -270,7 +273,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "bad hours"})
             if not NAME_RE.match(host):
                 return self._send(400, {"error": "bad host"})
-            return self._send(200, STORE.history(host, int(time.time()) - hours * 3600))
+            only = [m for m in q.get("metrics", [""])[0].split(",") if m]
+            if len(only) > MAX_METRICS or not all(NAME_RE.match(m) for m in only):
+                return self._send(400, {"error": "bad metrics"})
+            return self._send(200, STORE.history(host, int(time.time()) - hours * 3600, only))
         self._send(404, {"error": "not found"})
 
     def do_POST(self):

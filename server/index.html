@@ -9,11 +9,11 @@
 <style>
   :root {
     --bg: #f6f7f9; --card: #fff; --fg: #1b1f24; --muted: #6a737d; --border: #e1e4e8;
-    --ok: #1a7f37; --bad: #cf222e; --grid: #eaecef;
+    --ok: #1a7f37; --bad: #cf222e; --grid: #eaecef; --hover: #f0f2f5;
   }
   @media (prefers-color-scheme: dark) {
     :root { --bg: #0e1116; --card: #161b22; --fg: #e6edf3; --muted: #8b949e; --border: #30363d;
-            --ok: #3fb950; --bad: #f85149; --grid: #21262d; }
+            --ok: #3fb950; --bad: #f85149; --grid: #21262d; --hover: #1c2129; }
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg);
@@ -21,9 +21,12 @@
   main { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
   header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
   h1 { font-size: 20px; margin: 0; }
+  .tools { display: flex; gap: 8px; align-items: center; }
   .ranges button { background: var(--card); color: var(--fg); border: 1px solid var(--border);
                    padding: 4px 10px; border-radius: 6px; cursor: pointer; font: inherit; font-size: 13px; }
   .ranges button.on { border-color: var(--fg); font-weight: 600; }
+  #logout { background: none; border: 0; color: var(--muted); cursor: pointer; font: inherit; font-size: 13px; }
+
   .host { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
           padding: 16px; margin-top: 16px; }
   .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -37,6 +40,21 @@
   .chart { margin-top: 12px; width: 100%; overflow: hidden; }
   .uplot { font-family: inherit; }
   .u-legend { color: var(--fg); font-size: 12px; }
+
+  details.sensors { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+  details.sensors summary { cursor: pointer; color: var(--muted); font-size: 13px; user-select: none; }
+  .sensor-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+                 gap: 2px 12px; margin-top: 8px; }
+  .sensor-list label { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 6px;
+                       cursor: pointer; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .sensor-list label:hover { background: var(--hover); }
+  .sensor-list .sn { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sensor-list .sv { font-weight: 600; }
+  .sensor-list .sl { color: var(--muted); font-size: 11px; min-width: 52px; text-align: right; }
+  .sensor-actions { margin-top: 6px; display: flex; gap: 10px; }
+  .sensor-actions button { background: none; border: 0; padding: 0; color: var(--muted); cursor: pointer;
+                           font: inherit; font-size: 12px; text-decoration: underline; }
+
   footer { color: var(--muted); font-size: 12px; margin-top: 20px; text-align: center; }
   .err { color: var(--bad); }
   .hidden { display: none !important; }
@@ -47,8 +65,6 @@
            border: 1px solid var(--border); background: var(--bg); color: var(--fg); }
   #login button { background: var(--fg); color: var(--bg); border-color: var(--fg); cursor: pointer; font-weight: 600; }
   #login .err { font-size: 13px; min-height: 1em; margin: 0; }
-  .tools { display: flex; gap: 8px; align-items: center; }
-  #logout { background: none; border: 0; color: var(--muted); cursor: pointer; font: inherit; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -73,51 +89,38 @@
   <footer id="foot">loading…</footer>
 </main>
 <script>
-const COLORS = ["#e8590c", "#1c7ed6", "#2f9e44", "#ae3ec9", "#f08c00", "#0c8599", "#d6336c", "#5c940d"];
+const COLORS = ["#e8590c", "#1c7ed6", "#2f9e44", "#ae3ec9", "#f08c00", "#0c8599", "#d6336c", "#5c940d",
+                "#3b5bdb", "#c2255c", "#087f5b", "#e67700"];
+const DEFAULT_METRIC = "system";
 let hours = 24;
+let lastStatus = null;
 const charts = {};
 
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const ago = s => s < 90 ? `${s}s ago` : s < 5400 ? `${Math.round(s / 60)}m ago`
               : s < 172800 ? `${Math.round(s / 3600)}h ago` : `${Math.round(s / 86400)}d ago`;
-const label = m => m.toUpperCase();
+const label = m => m.replace(/_/g, " ").toUpperCase();
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls;
                                   if (text != null) e.textContent = text; return e; };
+const fmt = v => (Math.round(v * 10) / 10).toString();
+const limText = lim => lim[0] != null && lim[1] != null ? `${fmt(lim[0])}–${fmt(lim[1])}°`
+                     : lim[1] != null ? `≤${fmt(lim[1])}°` : `≥${fmt(lim[0])}°`;
+const outOfRange = (v, lim) => lim && ((lim[0] != null && v < lim[0]) || (lim[1] != null && v > lim[1]));
 
-function card(h) {
-  let c = document.getElementById("h-" + h.host);
-  if (!c) {
-    c = el("section", "host"); c.id = "h-" + h.host;
-    const head = el("div", "head");
-    head.append(el("span", "dot"), el("span", "name", h.host), el("span", "state"), el("div", "temps"));
-    c.append(head, el("div", "chart"));
-    document.getElementById("hosts").append(c);
+// Per-host sensor selection, remembered in this browser only.
+function getSel(h) {
+  let sel = null;
+  try { sel = JSON.parse(localStorage.getItem("pulse.sel." + h.host)); } catch (e) {}
+  if (!Array.isArray(sel)) sel = [];
+  sel = sel.filter(m => m in h.latest);
+  if (!sel.length) {
+    const all = Object.keys(h.latest).sort();
+    sel = all.includes(DEFAULT_METRIC) ? [DEFAULT_METRIC] : all.slice(0, 1);
   }
-  return c;
+  return sel;
 }
-
-function renderChart(c, host, data) {
-  const box = c.querySelector(".chart");
-  const metrics = Object.keys(data.series);
-  const key = metrics.join(",");
-  const width = box.clientWidth || 600;
-  const rows = [data.ts, ...metrics.map(m => data.series[m])];
-  const old = charts[host];
-  if (old && old.key === key) { old.u.setData(rows); old.u.setSize({ width, height: 220 }); return; }
-  if (old) old.u.destroy();
-  box.textContent = "";
-  if (!data.ts.length) { box.append(el("div", "state", "no data in range")); delete charts[host]; return; }
-  const axis = { stroke: css("--muted"), grid: { stroke: css("--grid"), width: 1 }, ticks: { stroke: css("--grid") } };
-  const u = new uPlot({
-    width, height: 220,
-    scales: { x: { time: true } },
-    axes: [axis, { ...axis, values: (u, v) => v.map(x => x + "°") }],
-    series: [{}, ...metrics.map((m, i) => ({
-      label: label(m), stroke: COLORS[i % COLORS.length], width: 1.5, spanGaps: false,
-      value: (u, v) => v == null ? "–" : v.toFixed(1) + "°C",
-    }))],
-  }, rows, box);
-  charts[host] = { u, key };
+function setSel(host, sel) {
+  try { localStorage.setItem("pulse.sel." + host, JSON.stringify(sel)); } catch (e) {}
 }
 
 class AuthError extends Error {}
@@ -135,31 +138,104 @@ function showLogin(msg) {
   document.getElementById("pw").focus();
 }
 
+function card(h) {
+  let c = document.getElementById("h-" + h.host);
+  if (!c) {
+    c = el("section", "host"); c.id = "h-" + h.host;
+    const head = el("div", "head");
+    head.append(el("span", "dot"), el("span", "name", h.host), el("span", "state"), el("div", "temps"));
+    const det = el("details", "sensors");
+    det.append(el("summary"), el("div", "sensor-list"), el("div", "sensor-actions"));
+    c.append(head, el("div", "chart"), det);
+    document.getElementById("hosts").append(c);
+  }
+  return c;
+}
+
+function renderHead(c, h, sel, now) {
+  c.querySelector(".dot").style.background = h.online ? css("--ok") : css("--bad");
+  c.querySelector(".state").textContent = (h.online ? "online" : "offline") +
+    (h.last_seen ? " · " + ago(now - h.last_seen) : " · never seen");
+  const temps = c.querySelector(".temps"); temps.textContent = "";
+  for (const m of sel) {
+    const v = h.latest[m], lim = (h.limits || {})[m];
+    const s = el("span"), b = el("b", null, Math.round(v) + "°C");
+    if (outOfRange(v, lim)) b.style.color = css("--bad");
+    s.append(el("small", null, label(m)), b);
+    if (lim) s.append(el("small", "lim", "limit " + limText(lim)));
+    if (!h.online) s.style.opacity = 0.5;
+    temps.append(s);
+  }
+}
+
+function renderSensors(c, h, sel) {
+  const all = Object.keys(h.latest).sort((a, b) => (b === DEFAULT_METRIC) - (a === DEFAULT_METRIC) || a.localeCompare(b));
+  c.querySelector("summary").textContent = `Sensors (${sel.length} of ${all.length} shown)`;
+  const list = c.querySelector(".sensor-list"); list.textContent = "";
+  for (const m of all) {
+    const v = h.latest[m], lim = (h.limits || {})[m];
+    const row = el("label"), cb = el("input");
+    cb.type = "checkbox"; cb.checked = sel.includes(m);
+    cb.addEventListener("change", () => {
+      const cur = getSel(h).filter(x => x !== m);
+      if (cb.checked) cur.push(m);
+      setSel(h.host, cur.length ? cur : [m]);   // never leave a host with nothing selected
+      if (!cur.length) cb.checked = true;
+      renderHost(h, lastStatus.now);
+    });
+    const val = el("span", "sv", fmt(v) + "°");
+    if (outOfRange(v, lim)) val.style.color = css("--bad");
+    row.append(cb, el("span", "sn", label(m)), val, el("span", "sl", lim ? limText(lim) : ""));
+    row.title = m;
+    list.append(row);
+  }
+  const act = c.querySelector(".sensor-actions"); act.textContent = "";
+  const allBtn = el("button", null, "show all"), defBtn = el("button", null, "reset");
+  allBtn.type = defBtn.type = "button";
+  allBtn.onclick = () => { setSel(h.host, all); renderHost(h, lastStatus.now); };
+  defBtn.onclick = () => { try { localStorage.removeItem("pulse.sel." + h.host); } catch (e) {} renderHost(h, lastStatus.now); };
+  act.append(allBtn, defBtn);
+}
+
+function renderChart(c, host, data, sel) {
+  const box = c.querySelector(".chart");
+  const metrics = sel.filter(m => m in data.series);
+  const key = metrics.join(",");
+  const width = box.clientWidth || 600;
+  const rows = [data.ts, ...metrics.map(m => data.series[m])];
+  const old = charts[host];
+  if (old && old.key === key) { old.u.setData(rows); old.u.setSize({ width, height: 220 }); return; }
+  if (old) old.u.destroy();
+  box.textContent = "";
+  if (!data.ts.length || !metrics.length) { box.append(el("div", "state", "no data in range")); delete charts[host]; return; }
+  const axis = { stroke: css("--muted"), grid: { stroke: css("--grid"), width: 1 }, ticks: { stroke: css("--grid") } };
+  const u = new uPlot({
+    width, height: 220,
+    scales: { x: { time: true } },
+    axes: [axis, { ...axis, values: (u, v) => v.map(x => x + "°") }],
+    series: [{}, ...metrics.map((m, i) => ({
+      label: label(m), stroke: COLORS[i % COLORS.length], width: 1.5, spanGaps: false,
+      value: (u, v) => v == null ? "–" : v.toFixed(1) + "°C",
+    }))],
+  }, rows, box);
+  charts[host] = { u, key };
+}
+
+async function renderHost(h, now) {
+  const c = card(h), sel = getSel(h);
+  renderHead(c, h, sel, now);
+  renderSensors(c, h, sel);
+  const q = `api/history?host=${encodeURIComponent(h.host)}&hours=${hours}&metrics=${encodeURIComponent(sel.join(","))}`;
+  renderChart(c, h.host, await api(q), sel);
+}
+
 async function refresh() {
   try {
     const st = await api("api/status");
+    lastStatus = st;
     document.getElementById("login").classList.add("hidden");
     document.getElementById("app").classList.remove("hidden");
-    for (const h of st.hosts) {
-      const c = card(h);
-      c.querySelector(".dot").style.background = h.online ? css("--ok") : css("--bad");
-      c.querySelector(".state").textContent = (h.online ? "online" : "offline") +
-        (h.last_seen ? " · " + ago(st.now - h.last_seen) : " · never seen");
-      const temps = c.querySelector(".temps"); temps.textContent = "";
-      for (const [m, v] of Object.entries(h.latest).sort()) {
-        const s = el("span"), lim = (h.limits || {})[m];
-        const b = el("b", null, v.toFixed(0) + "°C");
-        s.append(el("small", null, label(m)), b);
-        if (lim) {
-          if (v < lim[0] || v > lim[1]) b.style.color = css("--bad");
-          s.append(el("small", "lim", ` limit ${lim[0]}–${lim[1]}°C`));
-        }
-        if (!h.online) s.style.opacity = 0.5;
-        temps.append(s);
-      }
-      const hist = await api(`api/history?host=${encodeURIComponent(h.host)}&hours=${hours}`);
-      renderChart(c, h.host, hist);
-    }
+    for (const h of st.hosts) await renderHost(h, st.now);
     const f = document.getElementById("foot");
     f.textContent = "updated " + new Date().toLocaleTimeString() + " · refreshes every 60s"; f.className = "";
   } catch (e) {
