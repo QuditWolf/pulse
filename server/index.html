@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pulse</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.min.css">
+<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.iife.min.js"></script>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --fg: #1b1f24; --muted: #6a737d; --border: #e1e4e8;
+    --ok: #1a7f37; --bad: #cf222e; --grid: #eaecef;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0e1116; --card: #161b22; --fg: #e6edf3; --muted: #8b949e; --border: #30363d;
+            --ok: #3fb950; --bad: #f85149; --grid: #21262d; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
+  header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 20px; margin: 0; }
+  .ranges button { background: var(--card); color: var(--fg); border: 1px solid var(--border);
+                   padding: 4px 10px; border-radius: 6px; cursor: pointer; font: inherit; font-size: 13px; }
+  .ranges button.on { border-color: var(--fg); font-weight: 600; }
+  .host { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+          padding: 16px; margin-top: 16px; }
+  .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+  .name { font-weight: 600; font-size: 17px; }
+  .state { font-size: 13px; color: var(--muted); }
+  .temps { margin-left: auto; display: flex; gap: 14px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
+  .temps span b { font-size: 17px; }
+  .temps span small { color: var(--muted); margin-right: 4px; }
+  .chart { margin-top: 12px; width: 100%; overflow: hidden; }
+  .uplot { font-family: inherit; }
+  .u-legend { color: var(--fg); font-size: 12px; }
+  footer { color: var(--muted); font-size: 12px; margin-top: 20px; text-align: center; }
+  .err { color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Pulse</h1>
+    <div class="ranges" id="ranges">
+      <button data-h="6">6h</button><button data-h="24" class="on">24h</button><button data-h="168">7d</button>
+    </div>
+  </header>
+  <div id="hosts"></div>
+  <footer id="foot">loading…</footer>
+</main>
+<script>
+const COLORS = ["#e8590c", "#1c7ed6", "#2f9e44", "#ae3ec9", "#f08c00", "#0c8599", "#d6336c", "#5c940d"];
+let hours = 24;
+const charts = {};
+
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const ago = s => s < 90 ? `${s}s ago` : s < 5400 ? `${Math.round(s / 60)}m ago`
+              : s < 172800 ? `${Math.round(s / 3600)}h ago` : `${Math.round(s / 86400)}d ago`;
+const label = m => m.toUpperCase();
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls;
+                                  if (text != null) e.textContent = text; return e; };
+
+function card(h) {
+  let c = document.getElementById("h-" + h.host);
+  if (!c) {
+    c = el("section", "host"); c.id = "h-" + h.host;
+    const head = el("div", "head");
+    head.append(el("span", "dot"), el("span", "name", h.host), el("span", "state"), el("div", "temps"));
+    c.append(head, el("div", "chart"));
+    document.getElementById("hosts").append(c);
+  }
+  return c;
+}
+
+function renderChart(c, host, data) {
+  const box = c.querySelector(".chart");
+  const metrics = Object.keys(data.series);
+  const key = metrics.join(",");
+  const width = box.clientWidth || 600;
+  const rows = [data.ts, ...metrics.map(m => data.series[m])];
+  const old = charts[host];
+  if (old && old.key === key) { old.u.setData(rows); old.u.setSize({ width, height: 220 }); return; }
+  if (old) old.u.destroy();
+  box.textContent = "";
+  if (!data.ts.length) { box.append(el("div", "state", "no data in range")); delete charts[host]; return; }
+  const axis = { stroke: css("--muted"), grid: { stroke: css("--grid"), width: 1 }, ticks: { stroke: css("--grid") } };
+  const u = new uPlot({
+    width, height: 220,
+    scales: { x: { time: true } },
+    axes: [axis, { ...axis, values: (u, v) => v.map(x => x + "°") }],
+    series: [{}, ...metrics.map((m, i) => ({
+      label: label(m), stroke: COLORS[i % COLORS.length], width: 1.5, spanGaps: false,
+      value: (u, v) => v == null ? "–" : v.toFixed(1) + "°C",
+    }))],
+  }, rows, box);
+  charts[host] = { u, key };
+}
+
+async function refresh() {
+  try {
+    const st = await (await fetch("api/status")).json();
+    for (const h of st.hosts) {
+      const c = card(h);
+      c.querySelector(".dot").style.background = h.online ? css("--ok") : css("--bad");
+      c.querySelector(".state").textContent = (h.online ? "online" : "offline") +
+        (h.last_seen ? " · " + ago(st.now - h.last_seen) : " · never seen");
+      const temps = c.querySelector(".temps"); temps.textContent = "";
+      for (const [m, v] of Object.entries(h.latest).sort()) {
+        const s = el("span"); s.append(el("small", null, label(m)), el("b", null, v.toFixed(0) + "°C"));
+        if (!h.online) s.style.opacity = 0.5;
+        temps.append(s);
+      }
+      const hist = await (await fetch(`api/history?host=${encodeURIComponent(h.host)}&hours=${hours}`)).json();
+      renderChart(c, h.host, hist);
+    }
+    document.getElementById("foot").textContent = "updated " + new Date().toLocaleTimeString() + " · refreshes every 60s";
+  } catch (e) {
+    const f = document.getElementById("foot"); f.textContent = "update failed: " + e.message; f.className = "err";
+  }
+}
+
+document.getElementById("ranges").addEventListener("click", e => {
+  if (!e.target.dataset.h) return;
+  hours = +e.target.dataset.h;
+  for (const b of document.querySelectorAll(".ranges button")) b.classList.toggle("on", b === e.target);
+  refresh();
+});
+window.addEventListener("resize", () => {
+  for (const [host, { u }] of Object.entries(charts)) {
+    const box = document.querySelector(`#h-${CSS.escape(host)} .chart`);
+    if (box) u.setSize({ width: box.clientWidth, height: 220 });
+  }
+});
+refresh();
+setInterval(refresh, 60000);
+</script>
+</body>
+</html>

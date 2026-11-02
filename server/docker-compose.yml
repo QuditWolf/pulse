@@ -1,0 +1,14 @@
+services:
+  pulse:
+    build: .
+    container_name: pulse_server
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # Bind to the homeserver's VPN IP so only the VPS can reach it (set BIND_ADDR in .env).
+      - "${BIND_ADDR:-127.0.0.1}:5002:8080"
+    volumes:
+      - pulse-data:/data
+
+volumes:
+  pulse-data:
