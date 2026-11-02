@@ -30,8 +30,11 @@ slug() { tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/_/g; s/^_+|_+$//g; s/
 
 collect_ipmi() {
   command -v ipmitool >/dev/null 2>&1 || return 0
+  # Root (e.g. a systemd timer) needs no sudo; others use the narrow sudoers rule.
+  local run=(sudo -n /usr/bin/ipmitool)
+  (( EUID == 0 )) && run=(ipmitool)
   # Columns: name | value | unit | status | LNR | LCR | LNC | UNC | UCR | UNR
-  timeout 30 sudo -n /usr/bin/ipmitool sensor 2>/dev/null | awk -F'|' '
+  timeout 30 "${run[@]}" sensor 2>/dev/null | awk -F'|' '
     function num(x) { return x ~ /^-?[0-9]+(\.[0-9]+)?$/ }
     { for (i = 1; i <= NF; i++) gsub(/^ +| +$/, "", $i) }
     $3 == "degrees C" && num($2) {
